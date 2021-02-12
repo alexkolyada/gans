@@ -140,7 +140,7 @@ def train(args, netD, optimizerD, netG, optimizerG, num_epochs, dataloader, crit
             errD = errD_real + errD_fake
             optimizerD.step()
 
-            # Update G network: maximize log(D(G(z)))
+            # Update G network: minimize ||E[f(x)] - E[f(G(z))]||^2
             netG.zero_grad()
             label.fill_(real_label)  # fake labels are real for generator cost
             
