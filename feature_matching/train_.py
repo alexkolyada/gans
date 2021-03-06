@@ -1,86 +1,24 @@
 import argparse
 import wandb
+import sys
+from pathlib import Path
+
+sys.path.append(str(Path('.').resolve()))
 
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
 
 import torch.utils.data
-import torchvision.datasets as dset
+import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 import torch.nn.utils.spectral_norm as spectral_norm
+
 import torchvision.utils as vutils
 import torch.optim as optim
 
-class Generator(nn.Module):
-    def __init__(self, nz, ngf, nc):
-        super().__init__()
-
-        self.nz = nz
-        self.ngf = ngf
-        self.nc = nc
-        self.conv_blocks = nn.Sequential(
-            # input is Z, going into a convolution
-            nn.ConvTranspose2d(nz, ngf * 4, 4, 1, 0, bias=False),
-            nn.BatchNorm2d(ngf * 4),
-            nn.ReLU(),
-            # state size. (ngf*4) x 4 x 4
-            nn.ConvTranspose2d(ngf * 4, ngf * 2, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(ngf * 2),
-            nn.ReLU(),
-            # state size. (ngf*2) x 8 x 8
-            nn.ConvTranspose2d(ngf * 2, ngf, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(ngf),
-            nn.ReLU(),
-            # state size. (ngf) x 16 x 16
-            nn.ConvTranspose2d(ngf, nc, 4, 2, 3, bias=False),
-            nn.Tanh()
-            # state size. (nc) x 28 x 28
-        )
-
-    def forward(self, input):
-        return self.conv_blocks(input)
-
-class Discriminator(nn.Module):
-    def __init__(self, nc, ndf):
-        super().__init__()
-    
-        self.nc = nc
-        self.ndf = ndf
-        self.conv_blocks1 = nn.Sequential(
-            # input is (nc) x 28 x 28
-            nn.Conv2d(nc, ndf, 4, 2, 3, bias=False),
-            nn.LeakyReLU(0.2, inplace=True),
-            # state size. (ndf) x 16 x 16
-            nn.Conv2d(ndf, ndf * 2, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(ndf * 2),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-
-        self.conv_blocks2 = nn.Sequential(
-            # state size. (ndf*2) x 8 x 8
-            nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(ndf * 4),
-            nn.LeakyReLU(0.2, inplace=True),
-            # state size. (ndf*4) x 4 x 4
-            nn.Conv2d(ndf * 4, 1, 4, 1, 0, bias=False),
-            nn.Sigmoid()
-        )
-
-    def forward(self, input):
-        intermediate_ = self.conv_blocks1(input)
-
-        return intermediate_, self.conv_blocks2(intermediate_)
-
-
-def weights_init(net):
-    classname = net.__class__.__name__
-    if classname.find('Conv') != -1:
-        nn.init.normal_(net.weight.data, 0.0, 0.02)
-    elif classname.find('BatchNorm') != -1:
-        nn.init.normal_(net.weight.data, 1.0, 0.02)
-        nn.init.constant_(net.bias.data, 0)
-
+from fid import CustomTensorDataset, load_model, get_activations, compute_fid
+from feature_matching.models import Generator, Discriminator, weights_init
 
 def train_log(key, loss, example_ct, epoch):
     loss = float(loss)
@@ -113,9 +51,9 @@ def train(args, netD, optimizerD, netG, optimizerG, num_epochs, dataloader, crit
             ## Train with all-real batch
             netD.zero_grad()
             
-            real_cpu = data[0]
+            real_cpu = data[0].to(device)
             b_size = real_cpu.size(0)
-            label = torch.full((b_size,), real_label, dtype=torch.float)
+            label = torch.full((b_size,), real_label, dtype=torch.float, device=device)
             
             intermediate_real, output = netD(real_cpu)
             output = output.view(-1)
@@ -125,7 +63,7 @@ def train(args, netD, optimizerD, netG, optimizerG, num_epochs, dataloader, crit
             D_x = output.mean().item()
 
             ## Train with all-fake batch
-            noise = torch.randn(b_size, args.nz, 1, 1)
+            noise = torch.randn(b_size, args.nz, 1, 1, device=device)
             
             fake = netG(noise)
             label.fill_(fake_label)
@@ -140,15 +78,18 @@ def train(args, netD, optimizerD, netG, optimizerG, num_epochs, dataloader, crit
             errD = errD_real + errD_fake
             optimizerD.step()
 
-            # Update G network: minimize ||E[f(x)] - E[f(G(z))]||^2
+            # Update G network: minimize -log(D(G(z))) + alpha*||E[f(x)] - E[f(G(z))]||^2
             netG.zero_grad()
             label.fill_(real_label)  # fake labels are real for generator cost
             
             intermediate_fake, output_ = netD(fake)
-            intermediate_fake = torch.mean(intermediate_fake, dim=0).view(-1)
-            errG = (intermediate_real - intermediate_fake).pow(2).sum()
+            intermediate_fake, output_ = torch.mean(intermediate_fake, dim=0).view(-1), output_.view(-1)
+
+            err, reg = criterion(output_, label), (intermediate_real - intermediate_fake).pow(2).sum()
+            alpha = (0.2 * err / reg).detach().item()
+            errG = err + alpha * reg
             errG.backward()
-            D_G_z2 = output.mean().item()
+            D_G_z2 = output_.mean().item()
 
             # Update G
             optimizerG.step()
@@ -178,7 +119,7 @@ def train(args, netD, optimizerD, netG, optimizerG, num_epochs, dataloader, crit
     wandb.log({"img_list": img_list})
         
 def main():
-    wandb.init()
+    #wandb.init()
     # Training settings
     parser = argparse.ArgumentParser(description='PyTorch MNIST DCGAN with feature matching')
     parser.add_argument('--dataroot', type=str, default="data/mnist", metavar='dataroot',
@@ -210,31 +151,45 @@ def main():
     args = parser.parse_args()
     use_cuda = not args.no_cuda and torch.cuda.is_available()
 
-    wandb.config.update(args)
-
+    #wandb.config.update(args)
     torch.manual_seed(args.seed)
-
     device = torch.device("cuda" if use_cuda else "cpu")
-
     kwargs = {'num_workers': 1, 'pin_memory': True} if use_cuda else {}
 
-    dataset = dset.MNIST(
-        root=args.dataroot,
-        download=True,
-        transform=transforms.Compose([
+    data_transforms = {
+        'train': transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize((0.5), (0.5))])
+            transforms.Normalize([0.5], [0.5])
+        ]),
+        'test': transforms.Compose([
+            transforms.Resize(299),
+            transforms.CenterCrop(299),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ]),
+    }
+
+    train_loader = torch.utils.data.DataLoader(
+        datasets.MNIST(root=args.dataroot, download=True, train=True,
+                            transform=data_transforms['train']), 
+        batch_size=args.batch_size,
+        shuffle=True,
+        **kwargs,
+    )
+    
+    test_loader = torch.utils.data.DataLoader(
+        datasets.MNIST(root=args.dataroot, download=True, train=False,
+                            transform=data_transforms['test']), 
+        batch_size=args.batch_size,
+        shuffle=True,
+        **kwargs,
     )
 
-    dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True, **kwargs,
-    )
-
-    dcG = Generator(args.nz, args.ngf, args.nc)
+    dcG = Generator(args.nz, args.ngf, args.nc).to(device)
     # Apply the weights_init function to randomly initialize all weights to mean=0, stdev=0.2.
     dcG.apply(weights_init)
 
-    dcD = Discriminator(args.nc, args.ndf)
+    dcD = Discriminator(args.nc, args.ndf).to(device)
     # Apply the weights_init function to randomly initialize all weights to mean=0, stdev=0.2.
     dcD.apply(weights_init)
     
@@ -245,10 +200,38 @@ def main():
     opt_dcD = optim.Adam(dcD.parameters(), lr=args.lr, betas=(args.beta, 0.999))
     opt_dcG = optim.Adam(dcG.parameters(), lr=args.lr, betas=(args.beta, 0.999))
     
-    wandb.watch(dcD)
-    wandb.watch(dcG)
+    #wandb.watch(dcD)
+    #wandb.watch(dcG)
 
-    train(args, dcD, opt_dcD, dcG, opt_dcG, args.epochs, dataloader, criterion, device)
+    #train(args, dcD, opt_dcD, dcG, opt_dcG, args.epochs, train_loader, criterion, device)
+
+    dcG.eval()
+    with torch.no_grad():
+        fake_images = dcG(torch.randn(len(test_loader)*args.batch_size, args.nz, 1, 1, device=device))
+
+    fake_loader = torch.utils.data.DataLoader(
+        CustomTensorDataset(
+            tensor=fake_images,
+            transform=transforms.Compose([
+                transforms.ToPILImage(),
+                transforms.Resize(299),
+                transforms.CenterCrop(299),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5]),
+            ])
+        ),
+        batch_size=args.batch_size,
+        shuffle=True,
+        **kwargs
+    )
+
+    m = load_model(device)
+
+    real_pred, fake_pred = get_activations(m, args.batch_size, test_loader, fake_loader)
+    fid_score = compute_fid(real_pred, fake_pred)
+    
+    print(f"TOTAL FID:\t{fid_score:.2f}")
+    #wandb.log({"fid_score": fid_score}, step=i)
 
 
 if __name__ == '__main__':
